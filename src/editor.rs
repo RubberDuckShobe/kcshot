@@ -34,6 +34,7 @@ impl EditorWindow {
         window.set_decorated(false);
         window.show();
         window.fullscreen();
+        window.set_title(Some("kcshot.window.screenshot"));
 
         let surface = window
             .native()

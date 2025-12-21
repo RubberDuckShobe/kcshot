@@ -3,27 +3,22 @@
     reason = "The point of the wraps is to keep a consistent interface between xorg and wayland implementations"
 )]
 
-use cairo::ImageSurface;
-use gtk4::{
-    gio, glib,
-    prelude::{FileExt, InputStreamExtManual},
-};
-use kcshot_data::geometry::Rectangle;
+use cairo::{Format as CairoImageFormat, ImageSurface};
+use kcshot_data::{geometry::Rectangle, settings::Settings};
+use libwayshot::WayshotConnection;
 
 use super::{Result, Window, WmFeatures};
 use crate::DisplayServerKind;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("Encountered a desktop portal error: {0}")]
-    Ashpd(#[from] ashpd::Error),
-    #[error("Failed opening file(uri={uri}) for reading: {error}")]
-    GioFile { error: glib::Error, uri: String },
     #[error("Failed to deserialize output of '{command}': {error}")]
     Deserialize {
         error: serde_json::Error,
         command: String,
     },
+    #[error("Failed to take screenshot: {0}")]
+    Wayshot(#[from] libwayshot::Error),
 }
 
 pub(super) fn get_wm_features() -> Result<WmFeatures> {
@@ -33,6 +28,8 @@ pub(super) fn get_wm_features() -> Result<WmFeatures> {
         Ok(xdg_current_desktop) => {
             if xdg_current_desktop.eq_ignore_ascii_case("hyprland") {
                 DisplayServerKind::Hyprland
+            } else if xdg_current_desktop.eq_ignore_ascii_case("niri") {
+                DisplayServerKind::Niri
             } else {
                 tracing::warn!(
                     "Unknown Wayland compositor ('{xdg_current_desktop}'), assuming a generic Wayland setup."
@@ -50,47 +47,40 @@ pub(super) fn get_wm_features() -> Result<WmFeatures> {
 
     let wm_features = WmFeatures {
         display_server_kind,
-        should_use_portals: false,
+        screenshot_method: match display_server_kind {
+            DisplayServerKind::Niri | DisplayServerKind::Hyprland => {
+                crate::ScreenshotMethod::WlrScreencopy
+            }
+            _ => crate::ScreenshotMethod::Portals,
+        },
     };
 
     Ok(wm_features)
 }
 
-pub(super) fn take_screenshot(tokio: Option<&tokio::runtime::Handle>) -> Result<ImageSurface> {
-    let uri = tokio
-        .expect("kcshot is attempting to use portals but there is no tokio runtime running")
-        .block_on(async {
-            ashpd::desktop::screenshot::Screenshot::request()
-                .interactive(false)
-                .modal(false)
-                .send()
-                .await
-                .and_then(|r| r.response())
-                .map(|s| s.uri().to_string())
-        })
-        .map_err(Error::Ashpd)?;
+pub(super) fn take_screenshot() -> Result<ImageSurface> {
+    let wayshot_connection = WayshotConnection::new().map_err(Error::Wayshot)?;
+    let image_buffer = wayshot_connection
+        .screenshot_all(Settings::open().capture_mouse_cursor())
+        .map_err(Error::Wayshot)?;
 
-    let file = gio::File::for_uri(&uri);
-    let read = file
-        .read(gio::Cancellable::NONE)
-        .map_err(|error| Error::GioFile {
-            error,
-            uri: uri.clone(),
-        })?;
+    let width = image_buffer.width();
+    let height = image_buffer.height();
+    let stride = CairoImageFormat::Rgb24.stride_for_width(width)?;
 
-    // This is intentionally not using `?` to ensure screenshot file is deleted even if the surface can't be
-    // created.
-    let screenshot = ImageSurface::create_from_png(&mut read.into_read());
+    let screenshot = ImageSurface::create_for_data(
+        image_buffer
+            .into_vec()
+            .chunks_exact(4)
+            .flat_map(|c| [c[2], c[1], c[0], c[3]])
+            .collect::<Vec<_>>(),
+        CairoImageFormat::Rgb24,
+        width as i32,
+        height as i32,
+        stride,
+    )?;
 
-    // The org.freedesktop.Screenshot portal places the screenshots inside the user's home instead of
-    // making temp files, so this is to ensure that they get deleted and the user's home isn't polluted.
-    glib::MainContext::default().spawn_local(async move {
-        if let Err(why) = file.delete_future(glib::Priority::LOW).await {
-            tracing::error!("Failed to delete file {uri} due to {why}");
-        }
-    });
-
-    Ok(screenshot?)
+    Ok(screenshot)
 }
 
 pub(super) fn get_windows() -> Result<Vec<Window>> {

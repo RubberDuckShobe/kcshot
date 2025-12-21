@@ -4,6 +4,7 @@ use cairo::{self, Error as CairoError, ImageSurface};
 use kcshot_data::geometry::Rectangle;
 use tracing::error;
 
+mod portals;
 mod wayland;
 mod xorg;
 
@@ -23,6 +24,8 @@ pub enum Error {
     Xorg(#[from] xorg::Error),
     #[error("Encountered an error interacting with the Wayland stack: {0}")]
     Wayland(#[from] wayland::Error),
+    #[error("Encountered an error interacting with the FDo portals stack: {0}")]
+    Portals(#[from] portals::Error),
 }
 
 impl From<cairo::IoError> for Error {
@@ -47,12 +50,20 @@ enum DisplayServerKind {
     X11 { can_retrieve_windows: bool },
     GenericWayland,
     Hyprland,
+    Niri,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreenshotMethod {
+    Xcb,
+    Portals,
+    WlrScreencopy,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct WmFeatures {
     display_server_kind: DisplayServerKind,
-    should_use_portals: bool,
+    screenshot_method: ScreenshotMethod,
 }
 
 impl WmFeatures {
@@ -85,7 +96,9 @@ impl WmFeatures {
             xorg::get_wm_features()
         }?;
 
-        wm_features.should_use_portals = force_use_portals == "1";
+        if force_use_portals == "1" {
+            wm_features.screenshot_method = ScreenshotMethod::Portals;
+        }
 
         Ok(wm_features)
     }
@@ -99,27 +112,29 @@ impl WmFeatures {
             } | Hyprland
         )
     }
-
-    fn is_wayland(self) -> bool {
-        !matches!(self.display_server_kind, DisplayServerKind::X11 { .. })
-    }
 }
 
 pub fn take_screenshot(tokio: Option<&tokio::runtime::Handle>) -> Result<ImageSurface> {
-    if WmFeatures::get()?.is_wayland() {
-        wayland::take_screenshot(tokio)
-    } else {
-        xorg::take_screenshot()
+    match WmFeatures::get()?.screenshot_method {
+        ScreenshotMethod::Xcb => xorg::take_screenshot(),
+        ScreenshotMethod::Portals => portals::take_screenshot(tokio),
+        ScreenshotMethod::WlrScreencopy => wayland::take_screenshot(),
     }
 }
 
 /// Obtains a list of all windows from the display server, the list is in stacking order.
 pub fn get_windows() -> Result<Vec<Window>> {
-    if WmFeatures::get()?.is_wayland() {
-        wayland::get_windows()
-    } else {
-        xorg::get_windows()
+    match WmFeatures::get()?.screenshot_method {
+        ScreenshotMethod::Xcb => xorg::get_windows(),
+        ScreenshotMethod::Portals => Ok(vec![]),
+        ScreenshotMethod::WlrScreencopy => wayland::get_windows(),
     }
+}
+
+pub fn is_wayland() -> bool {
+    WmFeatures::get()
+        .map(|f| !matches!(f.display_server_kind, DisplayServerKind::X11 { .. }))
+        .unwrap_or(false)
 }
 
 pub fn will_make_use_of_desktop_portals() -> bool {
@@ -127,12 +142,9 @@ pub fn will_make_use_of_desktop_portals() -> bool {
         return false;
     };
 
-    if wm_features.should_use_portals {
+    if wm_features.screenshot_method == ScreenshotMethod::Portals {
         return true;
     }
 
-    matches!(
-        wm_features.display_server_kind,
-        DisplayServerKind::GenericWayland | DisplayServerKind::Hyprland,
-    )
+    false
 }

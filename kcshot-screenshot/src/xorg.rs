@@ -447,7 +447,7 @@ pub(super) fn get_wm_features() -> Result<WmFeatures> {
         display_server_kind: DisplayServerKind::X11 {
             can_retrieve_windows: false,
         },
-        should_use_portals: false,
+        screenshot_method: crate::ScreenshotMethod::Xcb,
     };
 
     if supported_ewmh_atoms.atom() == ATOM_NONE {
